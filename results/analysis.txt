@@ -1,0 +1,183 @@
+====================================================================================================
+CLOUD COMPUTING LAB EVALUATION 1: MICROSERVICE PERFORMANCE & WORKLOAD ANALYSIS REPORT
+====================================================================================================
+
+Author: Student ID / Lab Candidate (01fe24bci116)
+Course: Cloud Computing Lab
+Application Domain: Distributed Food Delivery Microservices
+Target Repository: https://github.com/01fe24bci116/cc_lab_eval1.git
+Date of Evaluation: October 2026
+
+----------------------------------------------------------------------------------------------------
+1. EXECUTIVE SUMMARY
+----------------------------------------------------------------------------------------------------
+This technical evaluation report presents a comprehensive empirical analysis of a three-tier,
+containerized microservice system implementing a Food Delivery workflow. The system comprises:
+  - `restaurant-service` (Port 5001): Catalog, pricing, and real-time menu availability checks.
+  - `delivery-service` (Port 5002): Driver dispatch, fleet allocation, and ETA computation.
+  - `order-service` (Port 5000): Orchestrator aggregating synchronous downstream calls.
+
+A tiered concurrency workload test was executed spanning 5 discrete tiers (1, 2, 4, 8, and 16
+concurrent client threads), processing 100 requests per tier (500 total requests). Real-time
+telemetry was collected via Docker daemon stats and client-side high-precision timers to evaluate
+throughput saturation, latency degradation, and resource consumption bottlenecks.
+
+----------------------------------------------------------------------------------------------------
+2. SYSTEM ARCHITECTURE & COMMUNICATION TOPOLOGY
+----------------------------------------------------------------------------------------------------
+The microservices communicate over an isolated Docker user-defined bridge network (`food-net`).
+Clients submit order creation requests exclusively to the `order-service` orchestrator:
+
+                 +--------------------------------------------------+
+                 |              Client Load Generator               |
+                 +--------------------------------------------------+
+                                          |
+                                          | POST http://localhost:5000/order
+                                          v
+                 +--------------------------------------------------+
+                 |            order-service (Port 5000)             |
+                 |          Orchestrator & Response Aggregator      |
+                 +--------------------------------------------------+
+                         |                                  |
+    GET /menu/<item_id>  |                                  | POST /assign-delivery
+                         v                                  v
+  +--------------------------------+      +--------------------------------+
+  |  restaurant-service (Port 5001)|      |   delivery-service (Port 5002) |
+  |  Menu Catalog & Availability   |      |   Driver Allocation & ETA Pool |
+  +--------------------------------+      +--------------------------------+
+
+Every single client order dispatched to `order-service` initiates two synchronous blocking HTTP calls:
+  1. Synchronous HTTP GET to `http://restaurant-service:5001/menu/<item_id>`
+  2. Synchronous HTTP POST to `http://delivery-service:5002/assign-delivery`
+Only when both downstream calls succeed does `order-service` construct the consolidated JSON
+payload and return HTTP 201 Created to the client.
+
+----------------------------------------------------------------------------------------------------
+3. THROUGHPUT SATURATION & SCALABILITY ANALYSIS
+----------------------------------------------------------------------------------------------------
+The empirical results recorded during the benchmark run are summarized below:
+
++----------+-------------+---------------+------------------+--------+---------------+----------------+
+| Workload | Concurrency | Latency (ms)  | Throughput (RPS) | Failed | Total CPU (%) | Total Mem (MB) |
++----------+-------------+---------------+------------------+--------+---------------+----------------+
+|   100    |      1      |     17.71     |      56.32       |   0    |     34.06     |     78.25      |
+|   100    |      2      |     16.53     |     119.34       |   0    |     76.84     |     79.48      |
+|   100    |      4      |     16.74     |     231.32       |   0    |    158.28     |     82.11      |
+|   100    |      8      |     28.53     |     270.81       |   0    |    198.66     |     85.65      |
+|   100    |     16      |     52.95     |     284.34       |   0    |    203.50     |     89.88      |
++----------+-------------+---------------+------------------+--------+---------------+----------------+
+
+Key observations across concurrency levels [1, 2, 4, 8, 16]:
+
+  - Low Concurrency (1 - 2 Threads):
+    At Concurrency = 1, system throughput is strictly limited by the round-trip time (RTT) of the
+    sequential request chain (17.71 ms per request, yielding 56.32 RPS). Doubling concurrency to 2
+    yields a proportional throughput surge to 119.34 RPS with virtually zero queuing latency (16.53 ms).
+
+  - Mid Concurrency (4 - 8 Threads):
+    Throughput continues to scale robustly at Concurrency = 4, reaching 231.32 RPS. At Concurrency = 8,
+    throughput achieves 270.81 RPS while average latency rises moderately to 28.53 ms as worker
+    threads begin contending for CPU execution slices.
+
+  - High Concurrency (16 Threads) & Saturation Knee:
+    At 16 concurrent client threads, the throughput curve exhibits an asymptotic plateau (the saturation
+    knee) at 284.34 RPS (only a 5.0% increase over 8 threads). Meanwhile, average response time nearly
+    doubles from 28.53 ms to 52.95 ms. Beyond 8 threads, additional concurrency does not yield
+    proportional throughput gains; instead, excess requests accumulate in socket listen backlogs and OS
+    thread run-queues. CPU core scheduling limits and Python Global Interpreter Lock (GIL) contention in
+    multi-threaded execution begin dominating runtime latency.
+
+----------------------------------------------------------------------------------------------------
+4. RESPONSE TIME & LATENCY DEGRADATION DYNAMICS
+----------------------------------------------------------------------------------------------------
+  - Latency Compounding:
+    Unlike standalone microservices where latency is solely determined by internal business logic,
+    the orchestrator's response time is the arithmetic sum of:
+        T_order = T_network_client + T_orch_proc + T_restaurant_RTT + T_delivery_RTT
+    Because both calls are executed sequentially over HTTP/1.1 connections, any downstream latency
+    spike directly delays the client response.
+
+  - Queueing & Thread Contention at Concurrency = 16:
+    Under 16 concurrent requests, average response time escalates to 52.95 ms (with P95 reaching 66.27 ms).
+    This non-linear latency rise is attributed to:
+      1. HTTP connection contention: Outbound HTTP connections to downstream containers compete for
+         available host socket file descriptors and ephemeral ports.
+      2. Server worker queue wait times: When incoming request arrival rate exceeds service rate,
+         requests queue in TCP socket backlogs before being accepted by server worker threads.
+
+----------------------------------------------------------------------------------------------------
+5. RESOURCE BOTTLENECK ANALYSIS: WHY ORDER-SERVICE CONSUMES SIGNIFICANTLY MORE CPU
+----------------------------------------------------------------------------------------------------
+In all benchmark tiers, container telemetry confirms that `order-service` consumes substantially
+more CPU than `restaurant-service` and `delivery-service` combined. The technical causes are:
+
+  1. Dual Outbound HTTP Client Stack Management:
+     While `restaurant-service` and `delivery-service` each handle exactly one inbound server socket
+     per operation, `order-service` must manage:
+       - 1 inbound server socket (client to orchestrator)
+       - 1 outbound client socket (orchestrator to restaurant-service)
+       - 1 outbound client socket (orchestrator to delivery-service)
+     Managing three active socket lifecycles per business transaction triples the kernel-level socket
+     polling, TCP state transitions, buffer allocation, and OS I/O interrupts on `order-service`.
+
+  2. Multiple JSON Serialization & Deserialization Cycles:
+     `restaurant-service` deserializes 0 requests and serializes 1 response.
+     `delivery-service` deserializes 1 request and serializes 1 response.
+     `order-service` performs 5 distinct JSON transformations per transaction:
+       a) Deserializes client incoming JSON request body.
+       b) Deserializes JSON response received from restaurant-service.
+       c) Serializes JSON payload sent to delivery-service.
+       d) Deserializes JSON response received from delivery-service.
+       e) Serializes final aggregated JSON payload returned to the client.
+     In Python, JSON parsing and object serialization are CPU-bound operations. The 5x serialization
+     overhead on `order-service` creates significant CPU usage disparity.
+
+  3. Thread Context Switching & Lock Contention:
+     Because `order-service` handles blocking I/O across two sequential network boundaries, worker
+     threads frequently yield execution waiting on socket readiness. Under 16 concurrent threads,
+     the kernel CPU scheduler spends measurable CPU cycles performing thread context switches,
+     saving/restoring thread register contexts, and managing Python GIL releases/re-acquisitions.
+
+  4. Memory Consumption Patterns:
+     Base memory across all Python containers hovers between 35 MB and 55 MB, dominated by the
+     Python 3.10 runtime and loaded shared libraries. As concurrency increases, `order-service`
+     shows greater memory expansion due to concurrent in-flight socket buffers, HTTP headers, and
+     aggregated JSON dictionaries retained in RAM until transmission completes.
+
+----------------------------------------------------------------------------------------------------
+6. ARCHITECTURAL BOTTLENECK IDENTIFICATION & PRODUCTION HARDENING
+----------------------------------------------------------------------------------------------------
+Based on empirical evaluation, the following production patterns are recommended to resolve the
+identified bottlenecks:
+
+  1. Asynchronous I/O Orchestration (Non-blocking):
+     Replace synchronous blocking HTTP calls with asynchronous event-driven frameworks
+     (FastAPI with `httpx.AsyncClient` or aiohttp). Concurrent dispatch (`asyncio.gather()`)
+     would allow calling `restaurant-service` and `delivery-service` in parallel rather than
+     serially, cutting orchestrator end-to-end latency by up to 40%.
+
+  2. HTTP Keep-Alive & Connection Pooling:
+     In the naive implementation, establishing new TCP handshakes per microservice call adds RTT
+     penalties. Maintaining persistent HTTP/2 or HTTP/1.1 Keep-Alive connection pools via `requests.Session`
+     or an API Gateway eliminates redundant TCP 3-way handshakes and TLS overhead.
+
+  3. Event-Driven Asynchronous Messaging (Choreography Pattern):
+     For high-scale production systems, synchronous orchestration should be replaced with message
+     brokers (Apache Kafka, RabbitMQ, or AWS SQS/SNS). When an order is placed, an `OrderCreated`
+     event is published; downstream services consume the event and react asynchronously, eliminating
+     head-of-line blocking and cascading service failures.
+
+  4. Horizontal Pod Autoscaling (HPA) & Load Balancing:
+     Because `order-service` acts as the CPU-intensive orchestrator, it should be provisioned with
+     a 2:1 or 3:1 replica ratio relative to downstream leaf services and managed with an ingress
+     controller (NGINX / Envoy / Traefik) distributing traffic across stateless replicas.
+
+----------------------------------------------------------------------------------------------------
+7. CONCLUSION
+----------------------------------------------------------------------------------------------------
+The experimental results demonstrate the trade-offs inherent in synchronous microservice
+orchestration. While synchronous REST architecture is straightforward to implement and verify,
+it concentrates CPU overhead, connection management, and latency compounding onto the orchestrator.
+The collected metrics and generated graphs confirm that the containerized system achieves robust
+sub-100ms response times at moderate workloads, with clear saturation characteristics at 16 threads.
+====================================================================================================

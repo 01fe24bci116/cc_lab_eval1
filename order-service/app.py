@@ -14,6 +14,21 @@ DELIVERY_SERVICE_URL = os.environ.get("DELIVERY_SERVICE_URL", "http://delivery-s
 ORDERS = []
 
 
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "service": "order-service (Orchestrator)",
+        "status": "RUNNING",
+        "description": "Food Delivery Microservice System Orchestrator",
+        "endpoints": {
+            "POST /order": "Create a new order with JSON payload",
+            "GET /orders": "View all placed orders",
+            "GET /health": "Service health check"
+        },
+        "sample_curl": "curl.exe -X POST http://localhost:5000/order -H \"Content-Type: application/json\" --% -d \"{\\\"customer_name\\\":\\\"Alice\\\", \\\"item_id\\\":\\\"1\\\"}\""
+    }), 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
@@ -34,8 +49,21 @@ def get_orders():
     }), 200
 
 
-@app.route("/order", methods=["POST"])
+@app.route("/order", methods=["GET", "POST"])
 def create_order():
+    if request.method == "GET":
+        return jsonify({
+            "message": "To place an order, send an HTTP POST request with a JSON body.",
+            "required_fields": {
+                "customer_name": "string",
+                "item_id": "string (1: Margherita Pizza, 2: Veg Burger, 3: Pasta Alfredo)"
+            },
+            "sample_payload": {
+                "customer_name": "Alice Smith",
+                "item_id": "1"
+            }
+        }), 200
+
     data = request.get_json(silent=True)
     if not data:
         return jsonify({
